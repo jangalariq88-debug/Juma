@@ -1,0 +1,1240 @@
+========== PAPER BOT V6 ==========
+import ccxt, time, json, os, threading, requests
+
+PAPER = True
+if not PAPER:
+    raise SystemExit('فقط حالت آزمایشی مجاز است.')
+COINS = ['BTC/USDT', 'ETH/USDT']
+TF = '1h'
+FAST, SLOW = 50, 200
+FEE = 0.001
+STOP_LOSS = 0.05
+RANGE_N = 120
+MIN_RANGE = 0.04
+SELL_ZONE = 0.75
+BUY_ZONES = [0.25, 0.15, 0.05]
+MIN_PROFIT = 0.01
+MAX_DRAWDOWN = 0.25
+REPORT_HOUR = '20'
+START_CAPITAL = 100.0
+STATE, TRADES, CHAT = 'state6.json', 'trades6.json', 'chat6.txt'
+
+TOKEN = open('token.txt').read().strip()
+API = f'https://api.telegram.org/bot{TOKEN}'
+
+if PAPER:
+    exchange = ccxt.binance({'enableRateLimit': True})
+else:
+    k = open('keys.txt').read().split()
+    exchange = ccxt.binance({'apiKey': k[0], 'secret': k[1], 'enableRateLimit': True})
+
+def load(p, d):
+    return json.load(open(p)) if os.path.exists(p) else d
+
+def save(p, d):
+    tmp = p + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(d, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+state = load(STATE, {})
+state.setdefault('paused', False)
+state.setdefault('last_report', '')
+state.setdefault('last_weekly', '')
+state.setdefault('peak', START_CAPITAL)
+state.setdefault('maxdd', 0.0)
+state.setdefault('coins', {})
+share = START_CAPITAL / len(COINS)
+for s in COINS:
+    state['coins'].setdefault(s, {'usdt': share, 'qty': 0.0, 'entry': 0.0, 'last_candle': 0})
+trades = load(TRADES, [])
+prices = {}
+
+OUTBOX = 'telegram_outbox6.json'
+
+def send(chat, text):
+    try:
+        r = requests.post(
+            API + '/sendMessage',
+            data={'chat_id': chat, 'text': text},
+            timeout=15
+        )
+        data = r.json()
+        return r.ok and data.get('ok') is True
+    except Exception as e:
+        print('خطای تلگرام:', e)
+        return False
+
+def notify(text):
+    queue = load(OUTBOX, [])
+    queue.append({'text': str(text), 'time': time.strftime('%Y-%m-%d %H:%M:%S')})
+    save(OUTBOX, queue)
+
+def telegram_outbox_loop():
+    while True:
+        try:
+            if os.path.exists(CHAT):
+                chat = open(CHAT).read().strip()
+                queue = load(OUTBOX, [])
+                while queue and chat:
+                    item = queue[0]
+                    if send(chat, item['text']):
+                        queue.pop(0)
+                        save(OUTBOX, queue)
+                    else:
+                        break
+        except Exception as e:
+            print('خطای صف تلگرام:', e)
+        time.sleep(5)
+
+def total():
+    return sum(c['usdt'] + c['qty'] * prices.get(s, c['entry'])
+               for s, c in state['coins'].items())
+
+def sma(v, n):
+    return sum(v[-n:]) / n
+
+def buy(s, price, reason):
+    c = state['coins'][s]
+    budget = c['usdt']
+    if PAPER:
+        qty = budget * (1 - FEE) / price
+        spent = budget
+    else:
+        q = float(exchange.amount_to_precision(s, budget * 0.995 / price))
+        raise SystemExit('سفارش واقعی غیرفعال است.')
+        qty = float(o.get('filled') or q)
+        price = float(o.get('average') or price)
+        spent = float(o.get('cost') or qty * price)
+    c['usdt'] = budget - spent
+    c['qty'], c['entry'] = qty, price
+    trades.append({'time': time.strftime('%m-%d %H:%M'), 'coin': s, 'side': 'خرید',
+                   'price': price, 'reason': reason, 'pnl': None})
+    notify(f"خرید {s} در {price:.2f} ({reason})")
+
+def sell(s, price, reason):
+    c = state['coins'][s]
+    entry = c['entry']
+    if PAPER:
+        got = c['qty'] * price * (1 - FEE)
+    else:
+        base = s.split('/')[0]
+        free = exchange.fetch_balance()[base]['free']
+        q = float(exchange.amount_to_precision(s, min(c['qty'], free)))
+        raise SystemExit('سفارش واقعی غیرفعال است.')
+        price = float(o.get('average') or price)
+        got = float(o.get('cost') or q * price)
+    c['usdt'] += got
+    c['qty'], c['entry'] = 0.0, 0.0
+    pnl = (price / entry - 1) * 100 if entry else 0.0
+    trades.append({'time': time.strftime('%m-%d %H:%M'), 'coin': s, 'side': 'فروش',
+                   'price': price, 'reason': reason, 'pnl': pnl})
+    notify(f"فروش {s} در {price:.2f} ({reason}) | نتیجه: {pnl:+.2f}%")
+
+def trades_table():
+    if not trades:
+        return 'هنوز معامله‌ای انجام نشده.'
+    lines = ['زمان | ارز | نوع | قیمت | دلیل']
+    for t in trades[-10:]:
+        extra = f" | {t['pnl']:+.1f}%" if t.get('pnl') is not None else ''
+        lines.append(f"{t['time']} | {t['coin'].split('/')[0]} | {t['side']} | {t['price']:.2f} | {t['reason']}{extra}")
+    return '\n'.join(lines)
+
+def report_text():
+    pnl = (total() / START_CAPITAL - 1) * 100
+    mode = 'شبیه‌سازی' if PAPER else 'واقعی'
+    st = 'متوقف' if state['paused'] else 'فعال'
+    lines = [f"گزارش | حالت: {mode} | وضعیت: {st}"]
+    for s, c in state['coins'].items():
+        pos = f"{c['qty']:.6f} (ورود {c['entry']:.2f})" if c['qty'] > 0 else 'بدون پوزیشن'
+        lines.append(f"{s}: {prices.get(s, 0):.2f} | {pos}")
+    lines.append(f"ارزش کل: {total():.2f} USDT ({pnl:+.2f}%)")
+    return '\n'.join(lines)
+
+def weekly_text():
+    sells = [t for t in trades if t['side'] == 'فروش']
+    wins = len([t for t in sells if t['pnl'] > 0])
+    losses = len(sells) - wins
+    pnl = (total() / START_CAPITAL - 1) * 100
+    return (f"گزارش هفتگی\nمعامله‌های بسته: {len(sells)} (برنده {wins}، بازنده {losses})\n"
+            f"بیشترین افت سرمایه: {state['maxdd'] * 100:.1f}%\n"
+            f"ارزش کل: {total():.2f} USDT ({pnl:+.2f}%)")
+
+def listener():
+    offset = None
+    while True:
+        try:
+            r = requests.get(API + '/getUpdates', params={'offset': -1}, timeout=20).json()
+            if r.get('result'):
+                offset = r['result'][-1]['update_id'] + 1
+            break
+        except Exception as e:
+            print('اتصال تلگرام برقرار نیست؛ تلاش دوباره:', e)
+            time.sleep(5)
+    while True:
+        try:
+            r = requests.get(API + '/getUpdates',
+                             params={'timeout': 30, 'offset': offset}, timeout=40).json()
+            for u in r.get('result', []):
+                offset = u['update_id'] + 1
+                m = u.get('message')
+                if not m:
+                    continue
+                chat, text = m['chat']['id'], m.get('text', '')
+                if not os.path.exists(CHAT):
+                    open(CHAT, 'w').write(str(chat))
+                if text.startswith('/start'):
+                    keyboard = {
+                        'keyboard': [[{
+                            'text': '📊 باز کردن داشبورد',
+                            'web_app': {
+                                'url': 'https://lined-ata-girls-silly.trycloudflare.com'
+                            }
+                        }]],
+                        'resize_keyboard': True
+                    }
+                    requests.post(
+                        API + '/sendMessage',
+                        json={
+                            'chat_id': chat,
+                            'text': 'برای دیدن داشبورد ربات، دکمه زیر را بزن:',
+                            'reply_markup': keyboard
+                        },
+                        timeout=15
+                    )
+                elif text.startswith('/price'):
+                    send(chat, '\n'.join(f"{s}: {p:.2f}" for s, p in prices.items()) or 'هنوز قیمتی نیست')
+                elif text.startswith('/trades'):
+                    send(chat, trades_table())
+                elif text.startswith('/weekly'):
+                    send(chat, weekly_text())
+                elif text.startswith('/status') or text.startswith('/report'):
+                    send(chat, report_text())
+                elif text.startswith('/stop'):
+                    state['paused'] = True
+                    send(chat, 'ربات متوقف شد. سیگنال جدید اجرا نمی‌شود (حد ضرر فعال می‌ماند). ادامه: /go')
+                elif text.startswith('/go'):
+                    state['paused'] = False
+                    send(chat, 'ربات دوباره فعال شد.')
+                else:
+                    send(chat, 'دستورها: /price /status /trades /report /weekly /stop /go')
+        except Exception as e:
+            print('خطای listener:', e)
+            time.sleep(5)
+
+
+LIVE_SEC = 5
+LIVE_FILE = 'live.json'
+info = {}
+live_ex = ccxt.binance({'enableRateLimit': True})
+
+def live_text():
+    try:
+        lp = live_ex.fetch_tickers(COINS)
+    except Exception:
+        lp = {}
+    lines = [f"زنده {time.strftime('%H:%M:%S')} | " + ('متوقف' if state['paused'] else 'فعال')]
+    tot = 0.0
+    unreal = 0.0
+    for s in COINS:
+        c = state['coins'][s]
+        p = (lp.get(s) or {}).get('last') or prices.get(s, 0)
+        tot += c['usdt'] + c['qty'] * p
+        if c['qty'] > 0:
+            unreal += c['qty'] * (p - c['entry'])
+        f, sl = info.get(s, (0, 0))
+        trend = 'نامشخص' if not f else ('صعودی' if f > sl else 'نزولی')
+        if c['qty'] > 0 and c['entry']:
+            pos = f"دارد ({(p / c['entry'] - 1) * 100:+.1f}%)"
+        else:
+            pos = 'ندارد'
+        lines.append(f"{s.split('/')[0]}: {p:.2f} | روند {trend} | پوزیشن {pos}")
+    lines.append(f"ارزش کل: {tot:.2f} USDT ({(tot / START_CAPITAL - 1) * 100:+.2f}%)")
+    real = (tot - START_CAPITAL) - unreal
+    lines.append(f"سود/ضرر: باز {unreal:+.2f} | بسته {real:+.2f} USDT")
+    for t in trades[-3:]:
+        extra = f" ({t['pnl']:+.1f}%)" if t.get('pnl') is not None else ''
+        lines.append(f"{t['time']} {t['coin'].split('/')[0]} {t['side']} {t['price']:.2f}{extra}")
+    return '\n'.join(lines)
+
+def live_loop():
+    mid = load(LIVE_FILE, {}).get('id')
+    while True:
+        try:
+            if os.path.exists(CHAT):
+                chat = open(CHAT).read().strip()
+                if chat:
+                    text = live_text()
+                    if mid is None:
+                        r = requests.post(API + '/sendMessage', data={'chat_id': chat, 'text': text}, timeout=15).json()
+                        if r.get('ok'):
+                            mid = r['result']['message_id']
+                            save(LIVE_FILE, {'id': mid})
+                    else:
+                        r = requests.post(API + '/editMessageText', data={'chat_id': chat, 'message_id': mid, 'text': text}, timeout=15).json()
+                        if not r.get('ok') and 'not found' in str(r.get('description', '')).lower():
+                            mid = None
+        except Exception as e:
+            print('خطای live:', e)
+        time.sleep(LIVE_SEC)
+
+threading.Thread(target=telegram_outbox_loop, daemon=True).start()
+threading.Thread(target=listener, daemon=True).start()
+threading.Thread(target=live_loop, daemon=True).start()
+print("ربات نسخه ۶ روشن شد... حالت:", "شبیه‌سازی" if PAPER else "واقعی")
+
+def buy_step(s, price, reason, budget):
+    c = state['coins'][s]
+    if PAPER:
+        qty = budget * (1 - FEE) / price
+        spent = budget
+    else:
+        q = float(exchange.amount_to_precision(s, budget * 0.995 / price))
+        raise SystemExit('سفارش واقعی غیرفعال است.')
+        qty = float(o.get('filled') or q)
+        price = float(o.get('average') or price)
+        spent = float(o.get('cost') or qty * price)
+    old = c['qty']
+    c['entry'] = (old * c['entry'] + qty * price) / (old + qty)
+    c['qty'] = old + qty
+    c['usdt'] -= spent
+    trades.append({'time': time.strftime('%m-%d %H:%M'), 'coin': s, 'side': 'خرید',
+                   'price': price, 'reason': reason, 'pnl': None})
+    notify(f"خرید {s} در {price:.2f} ({reason})")
+
+errors, alerted = 0, False
+while True:
+    try:
+        data = {}
+        for s in COINS:
+            cd = exchange.fetch_ohlcv(s, TF, limit=SLOW + 5)
+            data[s] = ([x[4] for x in cd[:-1]], cd[-2][0])
+            prices[s] = cd[-1][4]
+            info[s] = (sma([x[4] for x in cd[:-1]], FAST), sma([x[4] for x in cd[:-1]], SLOW))
+
+        for s in COINS:
+            c = state['coins'][s]
+            if c['qty'] > 0 and c['entry'] > 0 and prices[s] <= c['entry'] * (1 - STOP_LOSS):
+                sell(s, prices[s], 'حد ضرر')
+                c['cooldown_until'] = data[s][1] + 3 * 60 * 60 * 1000
+        t = total()
+        state['peak'] = max(state['peak'], t)
+        state['maxdd'] = max(state['maxdd'], (state['peak'] - t) / state['peak'])
+
+        if not state['paused'] and t < START_CAPITAL * (1 - MAX_DRAWDOWN):
+            for s in COINS:
+                if state['coins'][s]['qty'] > 0:
+                    sell(s, prices[s], 'سقف ضرر')
+            state['paused'] = True
+            notify('سرمایه از سقف ضرر پایین‌تر رفت. ربات متوقف شد. ادامه: /go')
+
+        for s in COINS:
+            c = state['coins'][s]
+            closed, ts = data[s]
+            if ts != c['last_candle'] and len(closed) > SLOW:
+                c['last_candle'] = ts
+                if ts <= c.get('cooldown_until', 0):
+                    continue
+                lo, hi = min(closed[-RANGE_N:]), max(closed[-RANGE_N:])
+                price = prices[s]
+                if not state['paused'] and hi - lo > price * MIN_RANGE:
+                    pos = (price - lo) / (hi - lo)
+                    steps = c.setdefault('steps', 3 if c['qty'] > 0 else 0)
+                    if c['qty'] > 0 and pos >= SELL_ZONE and price > c['entry'] * (1 + MIN_PROFIT):
+                        sell(s, price, 'سقف رنج')
+                        c['steps'] = 0
+                    elif steps < 3 and c['usdt'] > 1 and pos <= BUY_ZONES[steps]:
+                        buy_step(s, price, f'پله {steps + 1} رنج', c['usdt'] / (3 - steps))
+                        c['steps'] = steps + 1
+
+        today = time.strftime('%Y-%m-%d')
+        if time.strftime('%H') == REPORT_HOUR:
+            if state['last_report'] != today:
+                notify(report_text())
+                state['last_report'] = today
+            if time.strftime('%w') == '0' and state['last_weekly'] != today:
+                notify(weekly_text())
+                state['last_weekly'] = today
+
+        save(STATE, state)
+        save(TRADES, trades)
+        errors, alerted = 0, False
+        print(f"ارزش کل {total():.2f} USDT | " + ' | '.join(f"{s.split('/')[0]} {p:.2f}" for s, p in prices.items()))
+        time.sleep(60)
+    except Exception as e:
+        errors += 1
+        print(f"خطا ({errors}): {e}")
+        if errors >= 10 and not alerted:
+            notify(f"هشدار: {errors} خطای پشت‌سرهم. آخرین خطا: {str(e)[:150]}")
+            alerted = True
+        time.sleep(15)
+
+========== DASHBOARD ==========
+import json
+import os
+import random
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+HOST, PORT = "127.0.0.1", 8081
+
+
+def demo_state():
+    random.seed(7)
+    trades = []
+    pnl_total = 0.0
+    for i in range(8):
+        pnl = round(random.uniform(-0.6, 1.4), 2)
+        pnl_total += pnl
+        trades.append({
+            "time": f"2026-10-0{i + 1} 14:00",
+            "side": "SELL" if i % 2 else "BUY",
+            "price": 95000 + i * 400,
+            "qty": 0.0005,
+            "pnl": pnl if i % 2 else 0,
+        })
+    return {"initial": 100.0, "cash": 100.0 + pnl_total, "qty": 0.0,
+            "last_price": 98000.0, "symbol": "BTC/USDT", "trades": trades, "demo": True}
+
+
+import urllib.request
+import requests
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_json(name, default):
+    try:
+        with open(os.path.join(BASE, name), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def get_price(symbol, fallback):
+    try:
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=" + symbol.replace("/", "")
+        with urllib.request.urlopen(url, timeout=4) as r:
+            return float(json.loads(r.read())["price"])
+    except Exception:
+        return fallback
+
+
+def load_state():
+    return {"state": load_json("state6.json", {}), "trades": load_json("trades6.json", [])}
+
+
+def save_equity(equity):
+    path = os.path.join(BASE, "equity_history.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            history = json.load(f)
+        if not isinstance(history, list):
+            history = []
+    except (OSError, ValueError):
+        history = []
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not history or history[-1].get("time") != now:
+        history.append({"time": now, "equity": round(float(equity), 2)})
+        history = history[-2000:]
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    return history
+
+
+def build_summary(s):
+    coins = (s["state"] or {}).get("coins", {})
+    initial = 100.0
+    equity = 0.0
+    cash = 0.0
+    held = []
+    assets = []
+
+    for sym, c in coins.items():
+        usdt = float(c.get("usdt", 0))
+        qty = float(c.get("qty", 0))
+        price = get_price(sym, float(c.get("entry", 0)))
+        value = usdt + qty * price
+        equity += value
+        cash += usdt
+        assets.append({
+            "coin": sym.split("/")[0],
+            "qty": round(qty, 8),
+            "price": round(price, 2),
+            "value": round(value, 2),
+        })
+        if qty > 0:
+            held.append(sym.split("/")[0] + " " + str(round(qty, 6)))
+
+    history = save_equity(equity)
+    total_pnl = equity - initial
+    today = datetime.now().strftime("%m-%d")
+    trades = []
+    today_pct = 0.0
+
+    for t in reversed(s["trades"]):
+        raw = t.get("pnl")
+        pnl_pct = float(raw) if raw is not None else None
+        is_sell = "فروش" in str(t.get("side", ""))
+        trade_time = str(t.get("time", ""))
+
+        if is_sell and pnl_pct is not None and trade_time.startswith(today):
+            today_pct += pnl_pct
+
+        trades.append({
+            "time": trade_time,
+            "side": "SELL" if is_sell else "BUY",
+            "coin": t.get("coin", ""),
+            "price": t.get("price", 0),
+            "pnl_pct": pnl_pct,
+        })
+
+    comparison = load_json("comparison_log.json", [])
+    if not isinstance(comparison, list):
+        comparison = []
+    comparison = sorted(
+        comparison,
+        key=lambda r: int(r.get("candle_time", 0) or 0),
+        reverse=True
+    )[:10]
+
+    return {
+        "comparison": comparison,
+        "equity": round(equity, 2),
+        "initial": initial,
+        "total_pnl": round(total_pnl, 2),
+        "total_pct": round(total_pnl / initial * 100, 2),
+        "today_pct": round(today_pct, 2),
+        "cash": round(cash, 2),
+        "qty": " | ".join(held) if held else "0",
+        "symbol": "/",
+        "assets": assets,
+        "trades": trades[:50],
+        "equity_history": history,
+        "demo": False,
+    }
+
+PAGE = """<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>داشبورد ربات</title>
+<style>
+  :root { --bg:#0b1220; --card:#111a2c; --line:#1f2b44; --text:#e8eefc; --muted:#8493b3; --up:#2fd18b; --down:#ff6b6b; --accent:#3dd5f3; }
+  * { box-sizing: border-box; }
+  body { margin:0 auto; background:var(--bg); color:var(--text); font-family:system-ui,Tahoma,sans-serif; padding:16px 16px 90px; max-width:520px; }
+  h1 { font-size:22px; margin:4px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:18px; margin-bottom:12px; }
+  .label { color:var(--muted); font-size:13px; }
+  .big { font-size:40px; font-weight:700; margin:6px 0; direction:ltr; text-align:right; }
+  .row { display:flex; gap:12px; }
+  .row .card { flex:1; }
+  .num { direction:ltr; text-align:right; font-weight:700; font-size:22px; margin-top:6px; }
+  .up { color:var(--up); } .down { color:var(--down); } .flat { color:var(--muted); }
+  .sub { color:var(--muted); font-size:12px; margin-top:4px; direction:ltr; text-align:right; }
+  button.main { width:100%; margin-top:14px; padding:14px; border:0; border-radius:14px; font-size:16px; font-weight:700; color:#04121a; background:linear-gradient(90deg,#22d3ee,#6366f1); }
+  .note { color:var(--muted); font-size:12px; margin-top:8px; line-height:1.7; }
+  .tab { display:none; } .tab.active { display:block; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:9px 4px; border-bottom:1px solid var(--line); text-align:right; }
+  td.ltr { direction:ltr; }
+  nav { position:fixed; bottom:0; left:0; right:0; background:#0e1727; border-top:1px solid var(--line); display:flex; justify-content:space-around; padding:10px 0 14px; }
+  nav button { background:none; border:0; color:var(--muted); font-size:13px; padding:6px 14px; }
+  nav button.on { color:var(--accent); font-weight:700; }
+  .badge { display:inline-block; background:#3a2a10; color:#ffcc66; border-radius:8px; padding:3px 8px; font-size:12px; margin-bottom:10px; }
+  .faq b { display:block; margin-top:12px; }
+  .faq p { margin:4px 0 0; color:var(--muted); font-size:13px; line-height:1.8; }
+</style>
+</head>
+<body>
+<h1>ربات معامله‌گر (Paper)</h1>
+<div id="demo" class="badge" style="display:none">داده‌ی نمونه</div>
+
+<section id="dash" class="tab active">
+  <div class="card">
+    <div class="label">مقایسهٔ استراتژی و هوش مصنوعی</div>
+    <div id="comparison" class="note">در حال بارگذاری نتایج...</div>
+  </div>
+  <div class="card">
+    <div class="label">موجودی</div>
+    <div class="big" id="equity">-</div>
+    <div class="sub" id="pct">-</div>
+    <div class="row" style="margin-top:12px">
+      <div class="label">سرمایه اولیه</div>
+      <div class="label" id="initial" style="margin-inline-start:auto;direction:ltr">-</div>
+    </div>
+    <button class="main" onclick="show('wallet')">برداشت موجودی</button>
+    <div class="note">این حساب آزمایشی است؛ پول واقعی جابه‌جا نمی‌شود.</div>
+  </div>
+  <div class="card"><div class="label">نتیجهٔ معاملات فروش (%)</div><canvas id="pnlChart" height="150" style="width:100%;display:block"></canvas><div class="note">درصد تغییر قیمت معاملات فروش ثبت‌شده؛ نه تاریخچهٔ موجودی حساب.</div></div>
+  <div class="card"><div class="label">تاریخچهٔ موجودی حساب (USDT)</div><canvas id="equityChart" height="170" style="width:100%;display:block"></canvas><div class="note">ثبت موجودی از زمان فعال‌شدن این قابلیت آغاز می‌شود.</div></div>
+  <div class="row">
+    <div class="card"><div class="label">سود/زیان کل</div><div class="num" id="total">-</div></div>
+    <div class="card"><div class="label">سود/زیان امروز</div><div class="num" id="today">-</div></div>
+  </div>
+</section>
+
+<section id="trades" class="tab">
+  <div class="card">
+    <table>
+      <thead><tr><th>زمان</th><th>نوع</th><th>قیمت</th><th>سود</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="note" id="empty" style="display:none">هنوز معامله‌ای ثبت نشده.</div>
+  </div>
+</section>
+
+<section id="wallet" class="tab">
+  <div class="card">
+    <div class="label">نقد (USDT)</div><div class="num" id="cash">-</div>
+    <div class="label" style="margin-top:14px">دارایی کوین</div><div class="num" id="qty">-</div><div id="assets" class="note"></div>
+    <div class="note">واریز و برداشت واقعی بعد از اتصال به صرافی و تکمیل احراز هویت اضافه می‌شود.</div>
+  </div>
+</section>
+
+<section id="ai" class="tab">
+  <div class="card">
+    <div class="label">دستیار هوش مصنوعی</div>
+    <div class="note">سؤالت را دربارهٔ بازار، سیگنال‌ها، ریسک یا عملکرد ربات بنویس.</div>
+    <div id="aiChat" aria-live="polite"
+         style="margin-top:14px;max-height:45vh;overflow-y:auto;overflow-wrap:anywhere"></div>
+    <textarea id="aiInput" rows="3" maxlength="2000"
+      placeholder="مثلاً چرا سیگنال BTC برابر HOLD است؟"
+      style="width:100%;margin-top:12px;padding:12px;border-radius:12px;background:#0b1220;color:#e8eefc;border:1px solid #35415a;font:inherit"></textarea>
+    <button class="main" id="aiSend" onclick="sendAI()">ارسال به هوش مصنوعی</button>
+    <div class="note">پاسخ‌ها ممکن است اشتباه باشند؛ تصمیم معاملاتی را خودکار اجرا نمی‌کنند.</div>
+  </div>
+  <div class="card">
+    <div class="label">آخرین تحلیل‌های بازار</div>
+    <div id="aiMarket" class="note">در حال بارگذاری...</div>
+  </div>
+</section>
+<section id="faq" class="tab">
+  <div class="card faq">
+    <b>این ربات چه می‌کند؟</b>
+    <p>نزدیک کف محدوده می‌خرد و نزدیک سقف می‌فروشد. با ضرر نمی‌فروشد، مگر استاپ‌لاس عمیق.</p>
+    <b>حالت Paper یعنی چه؟</b>
+    <p>معاملات با پول مجازی انجام می‌شود تا قبل از پول واقعی عملکرد سنجیده شود.</p>
+  </div>
+</section>
+
+<nav>
+  <button class="on" data-t="dash" onclick="show('dash')">داشبورد</button>
+  <button data-t="trades" onclick="show('trades')">معاملات</button>
+  <button data-t="wallet" onclick="show('wallet')">کیف پول</button>
+  <button data-t="faq" onclick="show('faq')">سوالات</button>
+  <button data-t="ai" onclick="show('ai')">هوش مصنوعی</button>
+</nav>
+
+<script>
+function show(id) {
+  document.querySelectorAll('.tab').forEach(e => e.classList.toggle('active', e.id === id));
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.t === id));
+}
+function money(v, sign) { return (sign && v > 0 ? '+' : '') + v.toFixed(2) + '$'; }
+function cls(v) { return v > 0 ? 'up' : v < 0 ? 'down' : 'flat'; }
+
+function drawPnlChart(trades) {
+  const canvas = document.getElementById('pnlChart');
+  if (!canvas) return;
+
+  const w = canvas.clientWidth || 300, h = 170;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const vals = (trades || [])
+    .filter(t => t.side === 'SELL' && t.pnl_pct !== null)
+    .slice(0, 12).reverse()
+    .map(t => ({v: Number(t.pnl_pct), time: t.time}));
+
+  if (!vals.length) {
+    ctx.fillStyle = '#8493b3';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('هنوز معاملهٔ فروش ثبت نشده', w/2, h/2);
+    return;
+  }
+
+  const max = Math.max(1, ...vals.map(x => Math.abs(x)));
+  const mid = h/2;
+  const step = (w-20)/vals.length;
+
+  ctx.strokeStyle = '#35415a';
+  ctx.beginPath();
+  ctx.moveTo(8, mid);
+  ctx.lineTo(w-8, mid);
+  ctx.stroke();
+
+  vals.forEach((item, i) => {
+    const x = 10 + i*step + step*0.15;
+    const bh = Math.max(3, Math.abs(item.v)/max*(h/2-28));
+    ctx.fillStyle = item.v >= 0 ? '#2fd18b' : '#ff6b6b';
+    ctx.fillRect(x, item.v >= 0 ? mid-bh : mid, Math.max(3, step*0.7), bh);
+
+    ctx.fillStyle = item.v >= 0 ? '#2fd18b' : '#ff6b6b';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    const labelY = item.v >= 0 ? Math.max(12, mid-bh-6) : Math.min(h-24, mid+bh+14);
+    ctx.fillText((item.v > 0 ? '+' : '') + item.v.toFixed(2) + '%',
+                 x + step*0.35, labelY);
+  });
+}
+
+function drawEquityChart(history) {
+  const canvas = document.getElementById('equityChart');
+  if (!canvas) return;
+
+  const w = canvas.clientWidth || 300, h = 170;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const points = (history || [])
+    .filter(x => Number.isFinite(Number(x.equity)))
+    .slice(-30);
+
+  if (points.length < 2) {
+    ctx.fillStyle = '#8493b3';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('برای نمایش نمودار، کمی زمان لازم است', w/2, h/2);
+    return;
+  }
+
+  const vals = points.map(x => Number(x.equity));
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = Math.max(max - min, 0.1);
+  const left = 12, right = w - 12, top = 18, bottom = h - 24;
+
+  ctx.strokeStyle = '#35415a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const y = top + i * (bottom - top) / 3;
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(right, y);
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  vals.forEach((v, i) => {
+    const x = left + i * (right-left) / (vals.length-1);
+    const y = bottom - (v-min) / range * (bottom-top);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = vals[vals.length-1] >= vals[0] ? '#2fd18b' : '#ff6b6b';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  ctx.fillStyle = '#8493b3';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText(max.toFixed(2) + ' USDT', right, 12);
+  ctx.fillText(min.toFixed(2) + ' USDT', right, h-5);
+}
+
+let aiHistory = [];
+
+function addAIMessage(role, content) {
+  const box = document.getElementById('aiChat');
+  const item = document.createElement('div');
+  item.style.cssText = 'padding:10px;margin:8px 0;border-radius:12px;background:' +
+    (role === 'user' ? '#1f2b44' : '#111a2c') + ';white-space:pre-wrap';
+  const label = document.createElement('b');
+  label.textContent = role === 'user' ? 'شما' : 'هوش مصنوعی';
+  const body = document.createElement('div');
+  body.style.marginTop = '5px';
+  body.textContent = content;
+  item.append(label, body);
+  box.appendChild(item);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function sendAI() {
+  const input = document.getElementById('aiInput');
+  const button = document.getElementById('aiSend');
+  const message = input.value.trim();
+  if (!message || button.disabled) return;
+
+  input.value = '';
+  aiHistory.push({role: 'user', content: message});
+  addAIMessage('user', message);
+  button.disabled = true;
+  button.textContent = 'در حال دریافت پاسخ...';
+
+  try {
+    const response = await fetch('/ai-chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        message: message,
+        history: aiHistory.slice(-11, -1)
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'پاسخ دریافت نشد.');
+    const answer = String(data.answer || 'پاسخی دریافت نشد.');
+    aiHistory.push({role: 'assistant', content: answer});
+    aiHistory = aiHistory.slice(-12);
+    addAIMessage('assistant', answer);
+  } catch (e) {
+    addAIMessage('assistant', 'خطا: ' + (e.message || 'اتصال برقرار نشد.'));
+  } finally {
+    button.disabled = false;
+    button.textContent = 'ارسال به هوش مصنوعی';
+  }
+}
+
+document.getElementById('aiInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendAI();
+  }
+});
+
+async function refresh() {
+  try {
+    const d = await (await fetch('/api')).json();
+    document.getElementById('demo').style.display = d.demo ? 'inline-block' : 'none';
+    document.getElementById('equity').textContent = d.equity.toFixed(2) + '$';
+    const p = document.getElementById('pct');
+    p.textContent = (d.total_pct > 0 ? '+' : '') + d.total_pct + '%  (' + money(d.total_pnl, true) + ')';
+    p.className = 'sub ' + cls(d.total_pnl);
+    document.getElementById('initial').textContent = d.initial.toFixed(2) + '$';
+    const t = document.getElementById('total'); t.textContent = money(d.total_pnl, true); t.className = 'num ' + cls(d.total_pnl);
+    const o = document.getElementById('today'); o.textContent = (d.today_pct > 0 ? '+' : '') + d.today_pct.toFixed(2) + '%'; o.className = 'num ' + cls(d.today_pct);
+    document.getElementById('cash').textContent = d.cash.toFixed(2) + '$';
+    document.getElementById('qty').textContent = d.qty + ' ' + d.symbol.split('/')[0];
+    const tb = document.getElementById('tbody'); tb.innerHTML = '';
+    document.getElementById('empty').style.display = d.trades.length ? 'none' : 'block';
+    d.trades.forEach(x => {
+      const tr = document.createElement('tr');
+      const pnl = x.pnl_pct == null ? null : Number(x.pnl_pct);
+      tr.innerHTML = '<td class="ltr">' + x.time + '</td><td>' + (x.side === 'BUY' ? 'خرید' : 'فروش') +
+        '</td><td class="ltr">' + x.price + '</td><td class="ltr ' + cls(pnl || 0) + '">' + (pnl === null ? '-' : ((pnl > 0 ? '+' : '') + pnl.toFixed(2) + '%')) + '</td>';
+      tb.appendChild(tr);
+    });
+    const cp = document.getElementById('comparison');
+    cp.replaceChildren();
+    if (!Array.isArray(d.comparison) || !d.comparison.length) {
+      cp.textContent = 'هنوز نتیجه‌ای ثبت نشده است.';
+    } else {
+      d.comparison.forEach(x => {
+        const item = document.createElement('div');
+        item.style.cssText = 'padding:10px 0;border-bottom:1px solid #1f2b44';
+        const title = document.createElement('div');
+        title.style.cssText = 'font-weight:700;color:#e8eefc';
+        title.textContent = (x.symbol || '-') +
+          ' | استراتژی: ' + (x.strategy_signal || '-') +
+          ' | هوش مصنوعی: ' + (x.ai_signal || '-');
+        const detail = document.createElement('div');
+        detail.textContent = 'قیمت: ' + (x.price ?? '-') +
+          ' | زمان کندل: ' + (x.candle_time
+            ? new Date(Number(x.candle_time)).toLocaleString()
+            : '-');
+        const reason = document.createElement('div');
+        reason.style.cssText = 'margin-top:5px;overflow-wrap:anywhere';
+        reason.textContent = 'دلیل هوش مصنوعی: ' +
+          (x.ai_reason || 'دلیل ثبت نشده');
+        item.append(title, detail, reason);
+        cp.appendChild(item);
+      });
+    }
+    const market = document.getElementById('aiMarket');
+    if (market) {
+      market.replaceChildren();
+      const rows = Array.isArray(d.comparison) ? d.comparison.slice(0, 6) : [];
+      if (!rows.length) {
+        market.textContent = 'هنوز تحلیلی ثبت نشده است.';
+      } else {
+        rows.forEach(x => {
+          const item = document.createElement('div');
+          item.style.cssText = 'padding:9px 0;border-bottom:1px solid #1f2b44';
+          item.textContent = (x.symbol || '-') +
+            ' | استراتژی: ' + (x.strategy_signal || '-') +
+            ' | هوش مصنوعی: ' + (x.ai_signal || '-') +
+            '\nدلیل: ' + (x.ai_reason || 'ثبت نشده');
+          market.appendChild(item);
+        });
+      }
+    }
+    drawPnlChart(d.trades);
+    drawEquityChart(d.equity_history || []);
+    if (d.assets) document.getElementById('assets').textContent = d.assets.map(a => a.coin + ': ' + a.qty + ' | ' + a.value.toFixed(2) + ' USDT').join('  •  ');
+  } catch (e) { console.error('خطای داشبورد:', e); }
+}
+refresh(); setInterval(refresh, 15000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/api":
+            body = json.dumps(build_summary(load_state())).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        elif self.path in ("/", "/index.html"):
+            body = PAGE.encode("utf-8")
+            ctype = "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path != "/ai-chat":
+            self.send_error(404)
+            return
+
+        def reply(status, obj):
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 20000:
+                reply(400, {"error": "اندازهٔ پیام معتبر نیست."})
+                return
+
+            data = json.loads(self.rfile.read(length))
+            message = data.get("message", "")
+            if not isinstance(message, str) or not message.strip():
+                reply(400, {"error": "لطفاً سؤال خود را بنویس."})
+                return
+            message = message.strip()[:2000]
+
+            key_path = os.path.join(BASE, "openrouter_key.txt")
+            with open(key_path, encoding="utf-8") as f:
+                key = f.read().strip()
+            if not key:
+                reply(503, {"error": "کلید اتصال هوش مصنوعی تنظیم نشده است."})
+                return
+
+            comparison = load_json("comparison_log.json", [])
+            if not isinstance(comparison, list):
+                comparison = []
+            comparison = comparison[-8:]
+
+            signals = load_json("ai_signals.json", [])
+            if not isinstance(signals, list):
+                signals = []
+            signals = signals[-5:]
+
+            context = {
+                "comparison_results": comparison,
+                "recent_ai_signals": signals
+            }
+            system_prompt = (
+                "تو دستیار هوش مصنوعی داشبورد یک ربات رمزارز هستی. "
+                "به زبان فارسی روان پاسخ بده، مگر کاربر زبان دیگری بخواهد. "
+                "از اطلاعات زمینه‌ای زیر برای توضیح سیگنال‌ها، بازار، ریسک و مقایسه "
+                "استراتژی با هوش مصنوعی استفاده کن. اگر اطلاعات کافی نیست، صریح بگو. "
+                "سود را تضمین نکن و عدم قطعیت را توضیح بده. "
+                "این ربات در حالت آزمایشی است؛ هیچ سفارش یا معامله‌ای اجرا نکن "
+                "و ادعا نکن که سفارشی فرستاده‌ای. این اطلاعات را محرمانه نگه دار. "
+                "اطلاعات موجود داشبورد به صورت JSON: " +
+                json.dumps(context, ensure_ascii=False)[:12000]
+            )
+
+            messages = [{"role": "system", "content": system_prompt}]
+            history = data.get("history", [])
+            if isinstance(history, list):
+                for item in history[-10:]:
+                    if not isinstance(item, dict):
+                        continue
+                    role = item.get("role")
+                    content = item.get("content")
+                    if role in ("user", "assistant") and isinstance(content, str):
+                        messages.append({
+                            "role": role,
+                            "content": content[:2000]
+                        })
+            messages.append({"role": "user", "content": message})
+
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json={
+                    "model": "openrouter/free",
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "max_tokens": 900
+                },
+                timeout=45
+            )
+            response.raise_for_status()
+            result = response.json()
+            choices = result.get("choices") or []
+            answer = (choices[0].get("message") or {}).get("content")
+            if isinstance(answer, list):
+                answer = " ".join(
+                    part.get("text", "") for part in answer
+                    if isinstance(part, dict)
+                )
+            if not isinstance(answer, str) or not answer.strip():
+                reply(502, {"error": "مدل پاسخ متنی قابل استفاده نداد؛ دوباره تلاش کن."})
+                return
+            reply(200, {"answer": answer.strip()[:12000]})
+
+        except requests.Timeout:
+            reply(504, {"error": "پاسخ هوش مصنوعی طول کشید؛ دوباره تلاش کن."})
+        except requests.RequestException:
+            reply(502, {"error": "اتصال به سرویس هوش مصنوعی برقرار نشد."})
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            reply(500, {"error": "در پردازش درخواست خطایی رخ داد."})
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    print(f"Dashboard: http://{HOST}:{PORT}  (Ctrl+C to stop)")
+    HTTPServer((HOST, PORT), Handler).serve_forever()
+
+========== AI COMPARE ==========
+import os
+import json
+import time
+import requests
+from datetime import datetime
+
+KEY_FILE = "openrouter_key.txt"
+OUT_FILE = "ai_signals.json"
+MODEL = "openrouter/free"
+URL = "https://openrouter.ai/api/v1/chat/completions"
+
+def load_signals():
+    if not os.path.exists(OUT_FILE):
+        return []
+    try:
+        with open(OUT_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+def analyze(symbol, candles):
+    with open(KEY_FILE) as f:
+        key = f.read().strip()
+
+    prompt = (
+        "Analyze this crypto market data for paper-trading research only. "
+        "Return exactly one JSON object with keys signal and reason. "
+        "signal must be BUY, SELL, or HOLD. "
+        "Do not claim certainty. If data is insufficient, use HOLD. "
+        "The latest candle is last. Data is timestamp and close prices. "
+        f"Symbol: {symbol}. Candles: {json.dumps(candles[-30:])}"
+    )
+
+    content = ""
+    data = {}
+    for attempt in range(2):
+        try:
+            request_prompt = prompt
+            if attempt == 1:
+                request_prompt = (
+                    "Paper-trading research only. Return one JSON object "
+                    "with keys signal and reason. signal must be BUY, SELL, "
+                    "or HOLD. Give a short reason; if uncertain, use HOLD. "
+                    "Latest data: " + json.dumps(candles[-10:])
+                )
+
+            payload = {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": request_prompt}],
+                "temperature": 0,
+                "max_tokens": 800 if attempt == 0 else 300,
+                "response_format": {"type": "json_object"}
+            }
+            if attempt == 1:
+                payload["reasoning"] = {"enabled": False}
+
+            response = requests.post(
+                URL,
+                headers={"Authorization": "Bearer " + key},
+                json=payload,
+                timeout=45
+            )
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices") or []
+            message = choices[0].get("message", {}) if choices else {}
+            content = message.get("content")
+            print("DEBUG attempt:", attempt + 1)
+            print("DEBUG finish_reason:",
+                  choices[0].get("finish_reason") if choices else "no choices")
+            print("DEBUG content:", repr(content)[:500])
+            if isinstance(content, str) and content.strip():
+                break
+        except (requests.RequestException, ValueError, TypeError,
+                KeyError, IndexError) as e:
+            print("DEBUG request error:", type(e).__name__, str(e)[:200])
+            content = ""
+
+    if not isinstance(content, str) or not content.strip():
+        content = ""
+
+    signal = "HOLD"
+    reason = "پاسخ مدل قابل پردازش نبود؛ سیگنال امن HOLD ثبت شد."
+
+    try:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\\n", 1)[-1]
+            if cleaned.rstrip().endswith("```"):
+                cleaned = cleaned.rstrip()[:-3].strip()
+
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict) and obj.get("signal") in ("BUY", "SELL", "HOLD"):
+            signal = obj["signal"]
+            value = obj.get("reason")
+            reason = str(value).strip()[:500] if value else "مدل دلیل ارائه نکرد."
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+
+    record = {
+        "time": datetime.utcnow().isoformat() + "Z",
+        "symbol": symbol,
+        "signal": signal,
+        "reason": reason,
+        "price": candles[-1]["close"]
+    }
+    records = load_signals()
+    records.append(record)
+    with open(OUT_FILE + ".tmp", "w") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    os.replace(OUT_FILE + ".tmp", OUT_FILE)
+    return record
+
+if __name__ == "__main__":
+    print("AI comparison module ready; no orders can be placed.")
+
+========== COMPARISON RUNNER ==========
+import json
+import os
+import ccxt
+from datetime import datetime, timezone
+from ai_compare import analyze
+
+COINS = ['BTC/USDT', 'ETH/USDT']
+TF = '1h'
+RANGE_N = 120
+MIN_RANGE = 0.04
+SELL_ZONE = 0.75
+BUY_ZONES = [0.25, 0.15, 0.05]
+MIN_PROFIT = 0.01
+STOP_LOSS = 0.05
+LOG_FILE = 'comparison_log.json'
+
+def load_json(path, default):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+def save_json(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def strategy_signal(symbol, candles, state, price):
+    c = state['coins'][symbol]
+    if c['qty'] > 0 and c['entry'] > 0 and price <= c['entry'] * (1 - STOP_LOSS):
+        return 'SELL'
+    if state.get('paused', False):
+        return 'HOLD'
+    recent = [x['close'] for x in candles[-RANGE_N:]]
+    lo, hi = min(recent), max(recent)
+    if hi - lo <= price * MIN_RANGE:
+        return 'HOLD'
+    pos = (price - lo) / (hi - lo)
+    steps = c.get('steps', 3 if c['qty'] > 0 else 0)
+    if c['qty'] > 0 and pos >= SELL_ZONE and price > c['entry'] * (1 + MIN_PROFIT):
+        return 'SELL'
+    if steps < 3 and c['usdt'] > 1 and pos <= BUY_ZONES[steps]:
+        return 'BUY'
+    return 'HOLD'
+
+def main():
+    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 20000})
+    state = load_json('state6.json', {})
+    records = load_json(LOG_FILE, [])
+    if not state.get('coins'):
+        print('state6.json درست خوانده نشد.')
+        return
+    for symbol in COINS:
+        try:
+            raw = exchange.fetch_ohlcv(symbol, TF, limit=205)
+            closed = raw[:-1]
+            if len(closed) < RANGE_N:
+                print(symbol, 'داده کافی نیست.')
+                continue
+            latest = closed[-1]
+            candle_time = int(latest[0])
+            price = float(latest[4])
+            existing_idx = next(
+                (i for i, r in enumerate(records)
+                 if r.get('symbol') == symbol
+                 and r.get('candle_time') == candle_time),
+                None
+            )
+            if existing_idx is not None:
+                old_reason = records[existing_idx].get('ai_reason')
+                if old_reason and not old_reason.startswith(
+                    'پاسخ مدل قابل پردازش نبود'
+                ):
+                    print(symbol, 'این کندل قبلاً با دلیل معتبر بررسی شده است.')
+                    continue
+                print(symbol, 'نتیجه قبلی ناقص است؛ تحلیل را تازه می‌کنیم.')
+            candles = [{'timestamp': int(x[0]), 'close': float(x[4])} for x in closed]
+            rule = strategy_signal(symbol, candles, state, price)
+            ai = analyze(symbol, candles)
+            record = {
+                'candle_time': candle_time,
+                'symbol': symbol,
+                'price': price,
+                'strategy_signal': rule,
+                'ai_signal': ai['signal'],
+                'ai_reason': ai['reason'],
+                'recorded_at': datetime.now(timezone.utc).isoformat()
+            }
+            if existing_idx is not None:
+                records[existing_idx].update(record)
+            else:
+                records.append(record)
+            save_json(LOG_FILE, records)
+            print(f"{symbol} | قیمت: {price} | استراتژی: {rule} | هوش مصنوعی: {ai['signal']}")
+        except Exception as e:
+            print(f"خطا برای {symbol}: {str(e)[:180]}")
+    print('بررسی تمام شد؛ هیچ سفارشی ارسال نشد.')
+
+if __name__ == '__main__':
+    main()
